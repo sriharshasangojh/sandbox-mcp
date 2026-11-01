@@ -1,3 +1,4 @@
 .venv/
+.sandenv/
 __pycache__/
 *.db
