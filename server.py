@@ -1,3 +1,4 @@
+import subprocess
 from mcp.server.mcpserver import MCPServer
 
 mcp=MCPServer("sandbox")
@@ -6,6 +7,19 @@ mcp=MCPServer("sandbox")
 def multiply(a: int,b: int)-> int:
     """Multiply two numbers and return the product."""
     return a*b
+
+@mcp.tool()
+def run_code(code: str)->str:
+    """Run the code in an isolated container and return the output"""
+    result=subprocess.run(
+        ["docker","run","--rm","-i","python:3.12-slim","python","-"],
+        input=code,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout+result.stderr
+                          
+    
 
 
 if __name__== "__main__":
