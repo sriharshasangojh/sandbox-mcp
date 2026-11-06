@@ -38,6 +38,13 @@ def init_db():
 
 init_db()
 
+def save_db(started, code, status, exit_code, output):
+    with sqlite3.connect(DB) as db:
+        db.execute(
+            "INSERT INTO jobs (created_at,code,status,exit_code,output,duration_ms)"
+            "VALUES (?, ?, ?, ?, ?, ?)",(started,code,status,exit_code,output,int((time.time()-started)*1000)),
+        )
+
 mcp=MCPServer("sandbox")
 
 @mcp.tool()
@@ -49,7 +56,9 @@ def multiply(a: int,b: int)-> int:
 def run_code(code: str)->str:
     """Run the python code in an isolated container with no access to network and return the output"""
     name="sandbox"+uuid.uuid4().hex[:8]
+    started=time.time()
     if too_many():
+        save_db(started,code,"rate_limited",None,"")
         return "Too many runs. Wait a minute before trying again"
     try:
         result=subprocess.run(
@@ -68,14 +77,45 @@ def run_code(code: str)->str:
             timeout=10,
         )
     except subprocess.TimeoutExpired:
-        subprocess.run(["docker","kill",name],capture_output=True)    
+        subprocess.run(["docker","kill",name],capture_output=True)  
+        save_db(started,code, "timeout", None, "")  
         return "timed out after 10 seconds"
     out = result.stdout + result.stderr
     if len(out) > 64_000:
         out = out[:64_000] + "\n[output cut at 64 KB]"
+    if result.returncode == 0:
+        status = "ok"
+    elif result.returncode == 137:
+        status = "killed"
+    else:
+        status = "error"
+    save_db(started,code, status, result.returncode, out)
     return out
-                          
-    
+                    
+@mcp.tool()
+def list_jobs(limit: int = 10) -> str:
+    """List the most recent code runs: id, status, exit code and duration."""
+    limit = min(limit, 50)          # never return more than 50 rows
+    with sqlite3.connect(DB) as db:
+        rows = db.execute(
+            "SELECT id, status, exit_code, duration_ms FROM jobs ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    if not rows:
+        return "No jobs yet."
+    return "\n".join(f"#{r[0]} {r[1]} exit={r[2]} {r[3]}ms" for r in rows)   
+
+@mcp.tool()
+def get_job(job_id:int)->str:
+    """Get the row from jobs.db database based on the passed job id"""
+    with sqlite3.connect(DB) as db:
+        row=db.execute(
+            "SELECT id, status, exit_code, duration_ms FROM jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+    if not row:
+        return "No job with job_id exists in jobs"
+    return f"#{row[0]} {row[1]} exit={row[2]} {row[3]}ms"
 
 
 if __name__== "__main__":
