@@ -2,6 +2,7 @@ import subprocess
 import uuid
 from mcp.server.mcpserver import MCPServer
 import time
+import re
 from collections import deque
 import sqlite3, os
 
@@ -52,39 +53,91 @@ def multiply(a: int,b: int)-> int:
     """Multiply two numbers and return the product."""
     return a*b
 
+
+
+LOCKS = [
+    "--network", "none", "--user", "1234:5678",
+    "--read-only", "--tmpfs", "/work:rw,size=64m,noexec,nosuid,mode=1777",
+    "--workdir", "/work",
+    "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+    "--memory", "256m", "--memory-swap", "256m",
+    "--cpus", "0.5",
+    "--ulimit", "nofile=64:64",
+    "--pids-limit", "64",
+]
+
+
+
 @mcp.tool()
-def run_code(code: str)->str:
+def create_session():
+    """start a long-lived sandox that will return session id to pass it onto run_code"""
+    session_id=uuid.uuid4().hex[:8]
+    name="sbx"+session_id
+    result=subprocess.run(
+        ["docker","run","-d","--rm","--name",name,"--label","sandbox=1",*LOCKS,"python:3.12-slim","sleep","infinity"],
+        capture_output=True,text=True
+    )
+    if result.returncode != 0:
+        return "Could not start session: " + result.stderr
+    return session_id
+
+
+
+@mcp.tool()
+def destroy_session(session_id:str):
+    """destroy the container based on the session id given in input"""
+    if session_id:
+        if not re.fullmatch(r"[0-9a-f]{8}", session_id):
+            return "invalid session_id"
+        container="sbx"+session_id 
+        result=subprocess.run(["docker","kill",container],capture_output=True,text=True)  
+
+        if result.returncode !=0:
+            return "session not found"
+        return "session destroyed"     
+
+@mcp.tool()
+def run_code(code: str,session_id: str = "")->str:
     """Run the python code in an isolated container with no access to network and return the output"""
-    name="sandbox"+uuid.uuid4().hex[:8]
     started=time.time()
     if too_many():
         save_db(started,code,"rate_limited",None,"")
         return "Too many runs. Wait a minute before trying again"
+
+    if session_id:
+        if not re.fullmatch(r"[0-9a-f]{8}", session_id):
+            return "invalid session_id"
+        container="sbx"+session_id
+        cmd=["docker","exec","-i", container, "timeout", "10", "python", "-"]  
+        wait=15
+
+    else:
+        container="sandbox"+uuid.uuid4().hex[:8]
+        cmd=["docker","run", "--rm", *LOCKS, "--name",container,"-i", "python:3.12-slim", "python", "-"]     
+        wait=10
     try:
         result=subprocess.run(
-            ["docker","run","--rm","--network","none","--user","1234:5678",
-            "--read-only","--tmpfs", "/work:rw,size=64m,noexec,nosuid,mode=1777",
-            "--workdir", "/work",
-            "--cap-drop","ALL", "--security-opt","no-new-privileges",
-            "--memory","256m","--memory-swap","256m",
-            "--cpus","0.5",
-            "--ulimit", "nofile=64:64",
-            "--pids-limit","64", "--name", name,
-            "-i","python:3.12-slim","python","-"],
+            cmd,
             input=code,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=wait,
         )
     except subprocess.TimeoutExpired:
-        subprocess.run(["docker","kill",name],capture_output=True)  
+        subprocess.run(["docker","kill",container],capture_output=True)  
         save_db(started,code, "timeout", None, "")  
         return "timed out after 10 seconds"
+
+    if session_id and "No such container" in result.stderr:
+        return "Session not found or expired. Call create_session to start a new one."    
+
     out = result.stdout + result.stderr
     if len(out) > 64_000:
         out = out[:64_000] + "\n[output cut at 64 KB]"
     if result.returncode == 0:
         status = "ok"
+    elif result.returncode == 124:
+       status = "timeout"    
     elif result.returncode == 137:
         status = "killed"
     else:
