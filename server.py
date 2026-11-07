@@ -9,6 +9,12 @@ import sqlite3, os
 import threading
 limit = threading.BoundedSemaphore(3)
 
+IDLE_LIMIT=300
+SWEEP_EVERY=30
+
+sessions={}
+sessions_lock=threading.Lock()
+
 calls=deque()
 MAX_CALLS,WINDOW=10,60
 
@@ -79,6 +85,9 @@ def create_session():
     )
     if result.returncode != 0:
         return "Could not start session: " + result.stderr
+
+    with sessions_lock:
+        sessions[session_id]=time.time()    
     return session_id
 
 
@@ -91,7 +100,8 @@ def destroy_session(session_id:str):
             return "invalid session_id"
         container="sbx"+session_id 
         result=subprocess.run(["docker","kill",container],capture_output=True,text=True)  
-
+        with sessions_lock:
+            sessions.pop(session_id,None)
         if result.returncode !=0:
             return "session not found"
         return "session destroyed"     
@@ -107,6 +117,10 @@ def run_code(code: str,session_id: str = "")->str:
     if session_id:
         if not re.fullmatch(r"[0-9a-f]{8}", session_id):
             return "invalid session_id"
+        with sessions_lock:
+            if session_id not in sessions:
+                return "Session not found or expired. Call create_session to start a new one."
+            sessions[session_id] = time.time()    
         container="sbx"+session_id
         cmd=["docker","exec","-i", container, "timeout", "10", "python", "-"]  
         wait=15
@@ -125,11 +139,16 @@ def run_code(code: str,session_id: str = "")->str:
         )
     except subprocess.TimeoutExpired:
         subprocess.run(["docker","kill",container],capture_output=True)  
+        if session_id:
+            with sessions_lock:
+                sessions.pop(session_id, None)
         save_db(started,code, "timeout", None, "")  
-        return "timed out after 10 seconds"
+        return f"timed out after {wait} seconds"
 
     if session_id and "No such container" in result.stderr:
-        return "Session not found or expired. Call create_session to start a new one."    
+        with sessions_lock:
+            sessions.pop(session_id, None)
+        return "Session not found or expired. Call create_session to start a new one."
 
     out = result.stdout + result.stderr
     if len(out) > 64_000:
@@ -169,6 +188,29 @@ def get_job(job_id:int)->str:
     if not row:
         return "No job with job_id exists in jobs"
     return f"#{row[0]} {row[1]} exit={row[2]} {row[3]}ms"
+
+
+def cleanup_leftovers():
+    result = subprocess.run(["docker", "ps", "-q", "--filter", "label=sandbox=1"],
+                            capture_output=True, text=True)
+    ids = result.stdout.split()
+    if ids:
+        subprocess.run(["docker", "kill", *ids], capture_output=True)
+
+def sweeper():
+    while True:
+        time.sleep(SWEEP_EVERY)
+        now = time.time()
+        with sessions_lock:
+            idle = [sid for sid, last_used in sessions.items()
+                    if now - last_used > IDLE_LIMIT]
+            for sid in idle:
+                del sessions[sid]
+        for sid in idle:
+            subprocess.run(["docker", "kill", "sbx" + sid], capture_output=True)
+
+cleanup_leftovers()
+threading.Thread(target=sweeper, daemon=True).start()    
 
 
 if __name__== "__main__":
