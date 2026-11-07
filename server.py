@@ -5,7 +5,7 @@ import time
 import re
 from collections import deque
 import sqlite3, os
-
+from paths import safe_path
 import threading
 limit = threading.BoundedSemaphore(3)
 
@@ -163,6 +163,75 @@ def run_code(code: str,session_id: str = "")->str:
         status = "error"
     save_db(started,code, status, result.returncode, out)
     return out
+
+MAX_FILE=1_000_000
+
+WRITE_SCRIPT=("import sys,os;r=os.path.realpath(sys.argv[1]);assert r.startswith('/work/');"
+                "os.makedirs(os.path.dirname(r),exist_ok=True);"
+                "open(r,'wb').write(sys.stdin.buffer.read())")
+READ_SCRIPT = ("import sys,os;r=os.path.realpath(sys.argv[1]);assert r.startswith('/work/');"
+               "sys.stdout.buffer.write(open(r,'rb').read(64001))")
+
+def check_session(session_id):
+    """Return an error message, or None if the session is valid (and mark it as used now)."""
+    if not re.fullmatch(r"[0-9a-f]{8}", session_id):
+        return "invalid session_id"
+    with sessions_lock:
+        if session_id not in sessions:
+            return "Session not found or expired. Call create_session to start a new one."
+        sessions[session_id] = time.time()
+    return None
+
+@mcp.tool()
+def write_file(session_id: str, path: str, content: str)-> str:
+    """Write a file into /work of a session. path is relative, e.g. data/in.csv"""
+    container = "sbx" + session_id
+    err=check_session(session_id)
+    if err:
+        return err
+    full=safe_path(path)  
+    if full is None:
+        return "Invalid path"
+    data=content.encode("utf-8")
+
+    if len(data)>MAX_FILE:
+        return "File is too large (max 1 MB)"
+
+    try:
+        result=subprocess.run(["docker","exec","-i",container,"python","-c",WRITE_SCRIPT,full],
+        input=data, capture_output=True, timeout=15) 
+
+    except subprocess.TimedoutExpired:
+        return "File operation timed out."
+    if result.returncode != 0:
+        detail = (result.stderr + result.stdout).decode("utf-8", errors="replace")
+        return f"could not write file (exit {result.returncode}): {detail}"
+    return f"wrote {len(data)} bytes to {full}"     
+
+
+@mcp.tool()
+def read_file(session_id: str, path: str) -> str:
+    """Read a text file from /work of a session. path is relative, e.g. data/in.csv."""
+    err = check_session(session_id)
+    if err:
+        return err
+    full = safe_path(path)
+    if full is None:
+        return "Invalid path."
+    try:
+        result = subprocess.run(
+            ["docker", "exec", "-i", "sbx" + session_id, "python", "-c", READ_SCRIPT, full],
+            capture_output=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        return "File operation timed out."
+    if result.returncode != 0:
+        return "Could not read file: " + result.stderr.decode("utf-8", errors="replace")
+    text = result.stdout.decode("utf-8", errors="replace")
+    if len(result.stdout) > 64_000:
+        text = result.stdout[:64_000].decode("utf-8", errors="replace") + "\n[file cut at 64 KB]"
+    return text
+
+
                     
 @mcp.tool()
 def list_jobs(limit: int = 10) -> str:
