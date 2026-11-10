@@ -6,6 +6,7 @@ import re
 from collections import deque
 import sqlite3, os
 from paths import safe_path
+from locks import LOCKS
 import threading
 limit = threading.BoundedSemaphore(3)
 
@@ -58,19 +59,6 @@ mcp=MCPServer("sandbox")
 def multiply(a: int,b: int)-> int:
     """Multiply two numbers and return the product."""
     return a*b
-
-
-
-LOCKS = [
-    "--network", "none", "--user", "1234:5678",
-    "--read-only", "--tmpfs", "/work:rw,size=64m,noexec,nosuid,mode=1777",
-    "--workdir", "/work",
-    "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
-    "--memory", "256m", "--memory-swap", "256m",
-    "--cpus", "0.5",
-    "--ulimit", "nofile=64:64",
-    "--pids-limit", "64",
-]
 
 
 
