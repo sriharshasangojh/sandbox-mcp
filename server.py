@@ -61,21 +61,26 @@ def multiply(a: int,b: int)-> int:
     return a*b
 
 
+MAX_SESSIONS = 5
 
 @mcp.tool()
 def create_session():
-    """start a long-lived sandox that will return session id to pass it onto run_code"""
-    session_id=uuid.uuid4().hex[:8]
-    name="sbx"+session_id
-    result=subprocess.run(
-        ["docker","run","-d","--rm","--name",name,"--label","sandbox=1",*LOCKS,"python:3.12-slim","sleep","infinity"],
-        capture_output=True,text=True
+    """Start a long-lived sandbox and return a session id to pass to run_code."""
+    session_id = uuid.uuid4().hex[:8]
+    with sessions_lock:
+        if len(sessions) >= MAX_SESSIONS:
+            return f"Too many sessions (max {MAX_SESSIONS}). Destroy one with destroy_session first."
+        sessions[session_id] = time.time()      # reserve the slot before starting the container
+    name = "sbx" + session_id
+    result = subprocess.run(
+        ["docker", "run", "-d", "--rm", "--name", name, "--label", "sandbox=1",
+         *LOCKS, "python:3.12-slim", "sleep", "infinity"],
+        capture_output=True, text=True
     )
     if result.returncode != 0:
+        with sessions_lock:
+            sessions.pop(session_id, None)       # give the slot back
         return "Could not start session: " + result.stderr
-
-    with sessions_lock:
-        sessions[session_id]=time.time()    
     return session_id
 
 
