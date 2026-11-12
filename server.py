@@ -8,8 +8,10 @@ import sqlite3, os
 from paths import safe_path
 from locks import LOCKS
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 limit = threading.BoundedSemaphore(3)
+MAX_BATCH = 5
 
 IDLE_LIMIT=300
 SWEEP_EVERY=30
@@ -100,13 +102,9 @@ def destroy_session(session_id:str):
             return "session not found"
         return "session destroyed"     
 
-@mcp.tool()
-def run_code(code: str,session_id: str = "")->str:
-    """Run the python code in an isolated container with no access to network and return the output"""
-    started=time.time()
-    if too_many():
-        save_db(started,code,"rate_limited",None,"")
-        return "Too many runs. Wait a minute before trying again"
+def execute(code: str, session_id: str = "") -> str:
+    """Run one snippet (one-shot container, or inside a session) and return its output."""
+    started = time.time()
 
     if session_id:
         if not re.fullmatch(r"[0-9a-f]{8}", session_id):
@@ -114,30 +112,26 @@ def run_code(code: str,session_id: str = "")->str:
         with sessions_lock:
             if session_id not in sessions:
                 return "Session not found or expired. Call create_session to start a new one."
-            sessions[session_id] = time.time()    
-        container="sbx"+session_id
-        cmd=["docker","exec","-i", container, "timeout", "10", "python", "-"]  
-        wait=15
-
+            sessions[session_id] = time.time()
+        container = "sbx" + session_id
+        cmd = ["docker", "exec", "-i", container, "timeout", "10", "python", "-"]
+        wait = 15
     else:
-        container="sandbox"+uuid.uuid4().hex[:8]
-        cmd=["docker","run", "--rm", *LOCKS, "--name",container,"-i", "python:3.12-slim", "python", "-"]     
-        wait=10
+        container = "sandbox" + uuid.uuid4().hex[:8]
+        cmd = ["docker", "run", "--rm", *LOCKS, "--name", container, "-i",
+               "python:3.12-slim", "python", "-"]
+        wait = 10
+
     try:
         with limit:
-            result=subprocess.run(
-                cmd,
-                input=code,
-                capture_output=True,
-                text=True,
-                timeout=wait,
-            )
+            result = subprocess.run(cmd, input=code, capture_output=True,
+                                    text=True, timeout=wait)
     except subprocess.TimeoutExpired:
-        subprocess.run(["docker","kill",container],capture_output=True)  
+        subprocess.run(["docker", "kill", container], capture_output=True)
         if session_id:
             with sessions_lock:
                 sessions.pop(session_id, None)
-        save_db(started,code, "timeout", None, "")  
+        save_db(started, code, "timeout", None, "")
         return f"timed out after {wait} seconds"
 
     if session_id and "No such container" in result.stderr:
@@ -151,13 +145,46 @@ def run_code(code: str,session_id: str = "")->str:
     if result.returncode == 0:
         status = "ok"
     elif result.returncode == 124:
-       status = "timeout"    
+        status = "timeout"
     elif result.returncode == 137:
         status = "killed"
     else:
         status = "error"
-    save_db(started,code, status, result.returncode, out)
+    save_db(started, code, status, result.returncode, out)
     return out
+
+
+@mcp.tool()
+def run_code(code: str, session_id: str = "") -> str:
+    """Run Python code in an isolated container with no network and return the output.
+    Pass session_id (from create_session) to run inside that session."""
+    if too_many():
+        save_db(time.time(), code, "rate_limited", None, "")
+        return "Too many runs. Wait a minute before trying again"
+    return execute(code, session_id)
+
+
+@mcp.tool()
+def run_many(codes: list[str], session_id: str = "") -> str:
+    """Run several Python snippets at the same time (max 5) and return each result in order.
+    Pass session_id to run them all inside the same session."""
+    if not codes:
+        return "No code given."
+    if len(codes) > MAX_BATCH:
+        return f"Too many snippets (max {MAX_BATCH})."
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = []
+        for code in codes:
+            if too_many():
+                save_db(time.time(), code, "rate_limited", None, "")
+                futures.append(None)
+            else:
+                futures.append(pool.submit(execute, code, session_id))
+        results = ["Too many runs. Wait a minute before trying again" if f is None
+                   else f.result() for f in futures]
+
+    return "\n".join(f"--- #{i + 1} ---\n{r}" for i, r in enumerate(results))
 
 MAX_FILE=1_000_000
 
