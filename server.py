@@ -8,6 +8,7 @@ import sqlite3, os
 from paths import safe_path
 from locks import LOCKS
 import threading
+
 limit = threading.BoundedSemaphore(3)
 
 IDLE_LIMIT=300
@@ -123,13 +124,14 @@ def run_code(code: str,session_id: str = "")->str:
         cmd=["docker","run", "--rm", *LOCKS, "--name",container,"-i", "python:3.12-slim", "python", "-"]     
         wait=10
     try:
-        result=subprocess.run(
-            cmd,
-            input=code,
-            capture_output=True,
-            text=True,
-            timeout=wait,
-        )
+        with limit:
+            result=subprocess.run(
+                cmd,
+                input=code,
+                capture_output=True,
+                text=True,
+                timeout=wait,
+            )
     except subprocess.TimeoutExpired:
         subprocess.run(["docker","kill",container],capture_output=True)  
         if session_id:
